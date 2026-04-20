@@ -34,9 +34,11 @@ def get_gmail_service():
     
     return build('gmail', 'v1', credentials=creds)
 
-# 2. Get unread job-related emails using targeted ATS domains
+# 2. Get unread job-related emails safely without overly aggressive filtering
 def get_job_emails(service):
-    query = 'is:unread (from:greenhouse.io OR from:lever.co OR from:workday.com OR from:icims.com OR "application received" OR "interview")'
+    # Extremely broad keyword search to ensure NO real human follow-ups are missed.
+    # We rely entirely on the LLM's 'is_valid_application_update' to filter out the junk.
+    query = 'is:unread (application OR apply OR careers OR interview OR offer OR rejection OR "thank you")'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
     
@@ -114,12 +116,17 @@ def find_existing_application(company: str, role: str, thread_id: str, supabase:
     if res.data:
         return res.data[0]
 
-    # 2. Fallback: Try Company + Role match (Fuzzy equivalent logic)
+    # 2. Fallback: Try Company + Role match
     res = supabase.table('applications').select("*").ilike("company", f"%{company}%").execute()
     for row in res.data:
-        # Ensure role is not empty and loosely matches
-        if role and row.get('role') and role.lower() in row['role'].lower():
-            return row
+        if role and row.get('role'):
+            # To prevent merging DIFFERENT jobs at the SAME company, we enforce a strict similarity check
+            r1, r2 = role.lower(), row['role'].lower()
+            
+            # Exact matches or very strong overlaps (e.g., 'Software Engineer' vs 'Software Engineer - Backend' might be distinct, 
+            # so we only merge if one string heavily encompasses the other)
+            if r1 == r2 or (r1 in r2 and len(r1) > len(r2) * 0.6) or (r2 in r1 and len(r2) > len(r1) * 0.6):
+                return row
             
     return None
 
