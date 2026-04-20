@@ -9,24 +9,34 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 
 class ExtractedApplication(BaseModel):
+    is_valid_application_update: bool
     company: str
     role: str
     status: str
+    reasoning: str
 
-# 1. Reconstruct Gmail Session
+# 1. Reconstruct Gmail Session with Base64 Fallback
 def get_gmail_service():
-    token_json = os.environ.get("GMAIL_TOKEN")
-    if not token_json:
+    token_str = os.environ.get("GMAIL_TOKEN")
+    if not token_str:
         raise ValueError("GMAIL_TOKEN environment variable not set")
     
-    creds_dict = json.loads(token_json)
+    try:
+        # Check if it is valid base64
+        decoded_bytes = base64.b64decode(token_str).decode('utf-8')
+        # If it decoded successfully, it might be JSON, try loading it
+        creds_dict = json.loads(decoded_bytes)
+    except Exception:
+        # If any of the above fails, assume it's just raw JSON
+        creds_dict = json.loads(token_str)
+
     creds = Credentials.from_authorized_user_info(creds_dict)
     
     return build('gmail', 'v1', credentials=creds)
 
-# 2. Get unread job-related emails
+# 2. Get unread job-related emails using targeted ATS domains
 def get_job_emails(service):
-    query = "is:unread (application OR careers OR interview)"
+    query = 'is:unread (from:greenhouse.io OR from:lever.co OR from:workday.com OR from:icims.com OR "application received" OR "interview")'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
     
@@ -35,17 +45,13 @@ def get_job_emails(service):
         msg_id = msg['id']
         thread_id = msg['threadId']
         
-        # Get full message to read body
         full_msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
-        # Extract subject and body
         headers = full_msg['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
         
-        # Super simple body extraction (can be improved for multipart)
         body = ""
         if 'parts' in full_msg['payload']:
-            # Look for plain text parts
             for part in full_msg['payload']['parts']:
                 if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
                     body_data = part['body']['data']
@@ -58,12 +64,12 @@ def get_job_emails(service):
             "id": msg_id,
             "thread_id": thread_id,
             "subject": subject,
-            "body": body[:2000] # truncate to save tokens
+            "body": body[:2000] # truncate
         })
         
     return email_data
 
-# 3. LLM Extraction
+# 3. LLM Extraction with Adversarial Prompting
 def analyze_email_with_llm(subject: str, body: str) -> Optional[ExtractedApplication]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -73,11 +79,18 @@ def analyze_email_with_llm(subject: str, body: str) -> Optional[ExtractedApplica
     client = OpenAI(api_key=api_key)
     prompt = f"Subject: {subject}\n\nBody: {body}"
     
+    system_prompt = (
+        "Your first task is to determine if this email is a personal update regarding a specific job application. "
+        "If it is a generic job alert, marketing email, or newsletter, set is_valid_application_update to false and stop. "
+        "Otherwise, set it to true and extract the company name, position (role), and status (Applied/Interview/Rejection/Offer). "
+        "Remove suffixes like LLC, Inc, or LTD from the company name. Provide brief reasoning for your choice."
+    )
+
     try:
         completion = client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Extract the company name, position (role), and status (Applied/Interview/Rejection/Offer) from this email. Return strictly valid JSON matching the schema."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             response_format=ExtractedApplication,
@@ -87,22 +100,54 @@ def analyze_email_with_llm(subject: str, body: str) -> Optional[ExtractedApplica
         print(f"Failed to analyze email: {e}")
         return None
 
-# 4. Supabase Upsert
-def upsert_to_supabase(data: dict):
+# 4. Stateful Tracking Layer (Lookup then Act)
+def get_supabase_client() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_KEY")
     if not url or not key:
         raise ValueError("Supabase credentials not set")
+    return create_client(url, key)
+
+def find_existing_application(company: str, role: str, thread_id: str, supabase: Client):
+    # 1. Try exact thread match
+    res = supabase.table('applications').select("*").eq("thread_id", thread_id).execute()
+    if res.data:
+        return res.data[0]
+
+    # 2. Fallback: Try Company + Role match (Fuzzy equivalent logic)
+    res = supabase.table('applications').select("*").ilike("company", f"%{company}%").execute()
+    for row in res.data:
+        # Ensure role is not empty and loosely matches
+        if role and row.get('role') and role.lower() in row['role'].lower():
+            return row
+            
+    return None
+
+def process_application(thread_id: str, extracted: ExtractedApplication):
+    supabase = get_supabase_client()
     
-    supabase: Client = create_client(url, key)
-    try:
-        response = supabase.table('applications').upsert(data, on_conflict='thread_id').execute()
-        print(f"Upserted to Supabase! thread_id: {data.get('thread_id')}")
-    except Exception as e:
-        print(f"Failed to upsert to Supabase: {e}")
+    existing = find_existing_application(extracted.company, extracted.role, thread_id, supabase)
+    
+    if existing:
+        print(f"Match found! Updating existing record (ID: {existing['id']})")
+        # Update the status, and ensure the thread_id gets updated to the latest thread
+        update_data = {
+            "status": extracted.status,
+            "thread_id": thread_id # Keep thread_id current
+        }
+        supabase.table('applications').update(update_data).eq("id", existing['id']).execute()
+    else:
+        print("No existing application found. Creating new record.")
+        insert_data = {
+            "thread_id": thread_id,
+            "status": extracted.status,
+            "company": extracted.company,
+            "role": extracted.role
+        }
+        supabase.table('applications').insert(insert_data).execute()
 
 def main():
-    print("Starting job application tracker ETL pipeline...")
+    print("Starting Stateful tracking engine...")
     
     try:
         service = get_gmail_service()
@@ -114,21 +159,24 @@ def main():
     print(f"Found {len(emails)} unread job-related emails.")
     
     for email in emails:
-        print(f"Analyzing: {email['subject']}")
+        print(f"\nAnalyzing: {email['subject']}")
         extracted = analyze_email_with_llm(email['subject'], email['body'])
+        
         if extracted:
-            print(f"Extracted -> Company: {extracted.company}, Role: {extracted.role}, Status: {extracted.status}")
+            print(f"Valid Update: {extracted.is_valid_application_update}")
+            print(f"Reasoning: {extracted.reasoning}")
             
-            # Prepare data
-            data = {
-                "thread_id": email['thread_id'],
-                "status": extracted.status,
-                "company": extracted.company,
-                "role": extracted.role
-            }
-            upsert_to_supabase(data)
-            
-            # Mark as read so we don't process it again next run
+            if extracted.is_valid_application_update:
+                print(f"Extracted -> Company: {extracted.company}, Role: {extracted.role}, Status: {extracted.status}")
+                
+                try:
+                    process_application(email['thread_id'], extracted)
+                except Exception as e:
+                    print(f"Failed database operations for thread {email['thread_id']}: {e}")
+            else:
+                print("Skipping - Not a valid application update based on AI reasoning.")
+                
+            # Always mark as read to prevent infinite loop reprocessing
             try:
                 service.users().messages().modify(
                     userId='me', 
