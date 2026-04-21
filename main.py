@@ -18,6 +18,15 @@ class ExtractedApplication(BaseModel):
     status: Literal["Applied", "Screening", "Interview", "Rejected", "Offer"]
     reasoning: str
 
+STATUS_PRIORITY = {
+    "Rejected": 4,
+    "Offer": 4,
+    "Interview": 3,
+    "Screening": 2,
+    "Applied": 1,
+    "": 0
+}
+
 # 1. Reconstruct Gmail Session with Base64 Fallback
 def get_gmail_service():
     token_str = os.environ.get("GMAIL_TOKEN")
@@ -80,16 +89,15 @@ def analyze_email_with_llm(subject: str, body: str) -> Optional[ExtractedApplica
     prompt = f"Subject: {subject}\n\nBody: {body}"
     
     system_prompt = (
-        "You are an expert recruitment data analyst. Your task is to extract data regarding job applications.\n"
-        "Your first task is to determine if this email is a direct personal communication regarding a specific application.\n\n"
-        "Red Flags (set is_valid_application_update to false):\n"
-        "- The email lists multiple jobs from different companies.\n"
-        "- The email contains phrases like 'Apply Now' or 'Jobs for you'.\n"
-        "- The email is a newsletter or generic marketing from LinkedIn, Indeed, or Glassdoor.\n\n"
-        "Green Flags:\n"
-        "- The email is a confirmation of a specific submission.\n"
-        "- The email is a rejection, interview invite, or offer addressed specifically to the user.\n\n"
-        "If Green Flags apply, set is_valid_application_update to true and extract company name and position (role). "
+        "You are an expert recruitment analyst. Your goal is to identify human or automated status updates regarding a job application.\n\n"
+        "CRITICAL: Set is_valid_application_update to FALSE for:\n"
+        "- One-Time Passwords (OTP), sign-in codes, or verification links.\n"
+        "- Password reset confirmations.\n"
+        "- Generic 'Jobs for you' digests or newsletters.\n"
+        "- Automated surveys asking 'How was your experience?' (unless they explicitly state a status change).\n\n"
+        "Set to TRUE only for:\n"
+        "Rejections, Interview Invites, Offer Letters, or direct Application Confirmations.\n\n"
+        "If TRUE, extract company name and position (role). "
         "Also map the status strictly to 'Applied', 'Screening', 'Interview', 'Rejected', or 'Offer'. "
         "Remove suffixes like LLC, Inc, or LTD from the company name. Provide brief reasoning for your choice."
     )
@@ -118,7 +126,6 @@ def get_supabase_client() -> Client:
 
 def normalize_company(company: str) -> str:
     # Normalize heavily for fuzzy matching
-    # Strip common legal suffixes
     company = re.sub(r'(?i)\b(LLC|Inc|Corp|Ltd|Corporation|Limited)\b\.?', '', company)
     return company.strip()
 
@@ -130,12 +137,10 @@ def find_existing_application(company: str, role: str, thread_id: str, supabase:
 
     # 2. Fuzzy Entity Match
     normalized_company = normalize_company(company)
-    # Query potential candidates from the same company
     candidates = supabase.table('applications').select("*").ilike("company", f"%{normalized_company}%").execute()
     
     for entry in candidates.data:
         if role and entry.get('role'):
-            # Compare roles using fuzzy ratio
             score = fuzz.ratio(role.lower(), entry['role'].lower())
             if score > 85: # Threshold for high confidence match
                 return entry
@@ -147,25 +152,34 @@ def process_application(email_info: dict, extracted: ExtractedApplication):
     thread_id = email_info['thread_id']
     subject = email_info['subject']
     
-    # Check for existing record
     existing = find_existing_application(extracted.company, extracted.role, thread_id, supabase)
     
     # Prepare the event log payload
-    # Timestamp ideally in ISO format UTC
     now_iso = datetime.datetime.utcnow().isoformat() + "Z"
     new_event = {"date": now_iso, "subject": subject, "status": extracted.status}
     
     if existing:
-        print(f"Match found! Updating existing record (ID: {existing['id']})")
-        # Extend the existed event log, defaulting to empty list if None    
+        current_status = existing.get('status', 'Applied')
+        
+        # Pull existing history
         event_log = existing.get('event_log') or []
         event_log.append(new_event)
         
-        update_data = {
-            "status": extracted.status,
-            "thread_id": thread_id, # Link new thread
-            "event_log": event_log
-        }
+        # Only update if the new status has equal or higher priority
+        if STATUS_PRIORITY.get(extracted.status, 0) >= STATUS_PRIORITY.get(current_status, 0):
+            print(f"Match found! Updating Priority: {current_status} -> {extracted.status} (ID: {existing['id']})")
+            update_data = {
+                "status": extracted.status,
+                "thread_id": thread_id, # Link new thread
+                "event_log": event_log
+            }
+        else:
+            print(f"Regression blocked! Keeping '{current_status}' over '{extracted.status}'. Event appended to history.")
+            update_data = {
+                "thread_id": thread_id, # Still map the thread 
+                "event_log": event_log  # Append the history but don't drop the status priority
+            }
+            
         supabase.table('applications').update(update_data).eq("id", existing['id']).execute()
     else:
         print("No existing application found. Creating new record.")
